@@ -47,6 +47,7 @@
 #include "multi_path_sploit.h"
 #include "async_wake.h"
 #include "utils.h"
+#include "unar.h"
 
 @interface NSUserDefaults ()
 - (id)objectForKey:(id)arg1 inDomain:(id)arg2;
@@ -1259,6 +1260,7 @@ void exploit(mach_port_t tfp0,
     prefs_t prefs;
     bool needResources = false;
     bool needStrap = false;
+    bool needSubstrate = false;
     const char *amfid_payload = NULL;
     bool updatedResources = false;
 
@@ -1656,7 +1658,16 @@ void exploit(mach_port_t tfp0,
         _assert(chdir("/jb") == ERR_SUCCESS, message, true);
         
         _assert(chdir("/") == ERR_SUCCESS, message, true);
-        needResources = needStrap || !verifySha1Sums(@"/usr/share/undecimus/resources.txt");
+        needResources = needStrap || !verifySums(@"/usr/share/undecimus/resources.txt", HASHTYPE_SHA1);
+        if (needResources)
+            LOG(@"We need bootstrap");
+
+        needSubstrate = ( needStrap ||
+                         (access("/usr/libexec/substrate", F_OK) != ERR_SUCCESS) ||
+                         !verifySums(@"/var/lib/dpkg/info/mobilesubstrate.md5sums", HASHTYPE_MD5)
+                         );
+        if (needSubstrate)
+            LOG(@"We need substrate");
         _assert(chdir("/jb") == ERR_SUCCESS, message, true);
         
         if (needResources) {
@@ -1671,7 +1682,7 @@ void exploit(mach_port_t tfp0,
             _assert(init_file("/jb/amfid_payload.dylib", 0, 0644), message, true);
         }
         
-        if (needStrap) {
+        if (needStrap || needSubstrate) {
             NSString *tar_tar = pathForResource(@"tar.tar");
             untar([tar_tar UTF8String]);
             _assert(init_file("/jb/tar", 0, 0755), message, true);
@@ -1808,6 +1819,9 @@ void exploit(mach_port_t tfp0,
         } else {
             resources = [NSArray arrayWithContentsOfFile:@"/usr/share/undecimus/injectme.plist"];
         }
+        if (needStrap || needSubstrate) {
+            resources = [resources arrayByAddingObjectsFromArray:@[@"/jb/tar", @"/jb/lzma"]];
+        }
         if (cdhashFor(@"/usr/libexec/substrate") != nil) {
             resources = [resources arrayByAddingObject:@"/usr/libexec/substrate"];
         }
@@ -1886,57 +1900,6 @@ void exploit(mach_port_t tfp0,
     UPSTAGE();
     
     {
-        // Set Disable Loader.
-        LOG("Setting Disable Loader...");
-        SETMESSAGE(NSLocalizedString(@"Failed to set Disable Loader.", nil));
-        if (prefs.load_tweaks) {
-            clean_file("/var/tmp/.substrated_disable_loader");
-        } else {
-            _assert(create_file("/var/tmp/.substrated_disable_loader", 0, 644), message, true);
-        }
-        LOG("Successfully set Disable Loader.");
-    }
-    
-    UPSTAGE();
-    
-    {
-        // Patch amfid.
-        if (access("/usr/libexec/substrate", F_OK) == ERR_SUCCESS)
-        {
-            // Run substrate
-            LOG("Starting Substrate...");
-            SETMESSAGE(NSLocalizedString(@"Failed to start Substrate.", nil));
-            _assert(runCommand("/usr/libexec/substrate", NULL) == ERR_SUCCESS, message, false);
-        }
-        
-        LOG("Testing amfid...");
-        if (runCommand("/bin/true", NULL) != ERR_SUCCESS) {
-            LOG("Patching amfid...");
-            SETMESSAGE(NSLocalizedString(@"Failed to patch amfid.", nil));
-            _assert(clean_file("/var/tmp/amfid_payload.alive"), message, true);
-
-            pid_t amfidPid = pidOfProcess("/usr/libexec/amfid");
-            LOG("amfidPid: " "0x%x" "\n", amfidPid);
-            _assert(amfidPid > 1, message, true);
-            uint64_t amfidProcAddr = getProcStructForPid(amfidPid);
-            LOG("amfidProcAddr: " ADDR "\n", amfidProcAddr);
-            _assert(ISADDR(amfidProcAddr), message, true);
-            _assert(platformizeProcAtAddr(amfidProcAddr) == ERR_SUCCESS, message, true);
-            task_t amfidTaskPort = proc_to_task_port(amfidProcAddr, myProcAddr);
-            LOG("amfidTaskPort: " "0x%x" "\n", amfidTaskPort);
-            _assert(MACH_PORT_VALID(amfidTaskPort), message, true);
-            call_remote(amfidTaskPort, dlopen, 2, REMOTE_CSTRING(amfid_payload), REMOTE_LITERAL(RTLD_NOW));
-            _assert(call_remote(amfidTaskPort, dlerror, 0) == ERR_SUCCESS, message, true);
-            _assert(waitForFile("/var/tmp/amfid_payload.alive") == ERR_SUCCESS, message, true);
-            LOG("Successfully patched amfid.");
-        } else {
-            LOG("Amfid already patched.");
-        }
-    }
-    
-    UPSTAGE();
-    
-    {
         // Update version string.
         
         if (!isJailbroken()) {
@@ -1952,6 +1915,35 @@ void exploit(mach_port_t tfp0,
             _assert(strstr(u.version, kernelVersionString) != NULL, message, true);
             LOG("Successfully updated version string.");
         }
+    }
+    
+    UPSTAGE();
+    
+    {
+        // Load Substrate
+        
+        // Set Disable Loader.
+        LOG("Setting Disable Loader...");
+        SETMESSAGE(NSLocalizedString(@"Failed to set Disable Loader.", nil));
+        if (prefs.load_tweaks) {
+            clean_file("/var/tmp/.substrated_disable_loader");
+        } else {
+            _assert(create_file("/var/tmp/.substrated_disable_loader", 0, 644), message, true);
+        }
+        LOG("Successfully set Disable Loader.");
+
+        // Extract Substrate if necessary
+        if (needSubstrate) {
+            ARFile *substrate_deb = [ARFile arFileWithFile:pathForResource(@"mobilesubstrate.deb")];
+            _assert(substrate_deb != nil, message, true);
+            _assert([substrate_deb extract:@"data.tar.lzma" toPath:@"/jb/substrate.tar.lzma"], message, true);
+            int rv = runCommand("/jb/tar", "--use-compress-program=/jb/lzma", "-xvC", "/", "-f", "/jb/substrate.tar.lzma", NULL);
+            _assert(rv == ERR_SUCCESS, message, true);
+        }
+        // Run substrate
+        LOG("Starting Substrate...");
+        SETMESSAGE(NSLocalizedString(@"Failed to start Substrate.", nil));
+        _assert(runCommand("/usr/libexec/substrate", NULL) == ERR_SUCCESS, message, false);
     }
     
     UPSTAGE();
@@ -1983,6 +1975,10 @@ void exploit(mach_port_t tfp0,
                 extractResources();
             }
         }
+        // Now that things are running, let's install the deb for the files we just extracted
+        if (needSubstrate) {
+            installDeb("mobilesubstrate.deb", true);
+        }
         if (access("/.installed_unc0ver", F_OK) != ERR_SUCCESS) {
             _assert(create_file("/.installed_unc0ver", 0, 0644), message, true);
         }
@@ -2005,6 +2001,35 @@ void exploit(mach_port_t tfp0,
             symlink("/usr/lib/libjailbreak.dylib", "/electra/libjailbreak.dylib");
         }
         LOG("Successfully extracted bootstrap.");
+    }
+    
+    UPSTAGE();
+    
+    {
+        // Patch amfid.
+        LOG("Testing amfid...");
+        if (runCommand("/bin/true", NULL) != ERR_SUCCESS) {
+            LOG("Patching amfid...");
+            SETMESSAGE(NSLocalizedString(@"Failed to patch amfid.", nil));
+            _assert(clean_file("/var/tmp/amfid_payload.alive"), message, true);
+            
+            pid_t amfidPid = pidOfProcess("/usr/libexec/amfid");
+            LOG("amfidPid: " "0x%x" "\n", amfidPid);
+            _assert(amfidPid > 1, message, true);
+            uint64_t amfidProcAddr = getProcStructForPid(amfidPid);
+            LOG("amfidProcAddr: " ADDR "\n", amfidProcAddr);
+            _assert(ISADDR(amfidProcAddr), message, true);
+            _assert(platformizeProcAtAddr(amfidProcAddr) == ERR_SUCCESS, message, true);
+            task_t amfidTaskPort = proc_to_task_port(amfidProcAddr, myProcAddr);
+            LOG("amfidTaskPort: " "0x%x" "\n", amfidTaskPort);
+            _assert(MACH_PORT_VALID(amfidTaskPort), message, true);
+            call_remote(amfidTaskPort, dlopen, 2, REMOTE_CSTRING(amfid_payload), REMOTE_LITERAL(RTLD_NOW));
+            _assert(call_remote(amfidTaskPort, dlerror, 0) == ERR_SUCCESS, message, true);
+            _assert(waitForFile("/var/tmp/amfid_payload.alive") == ERR_SUCCESS, message, true);
+            LOG("Successfully patched amfid.");
+        } else {
+            LOG("Amfid already patched.");
+        }
     }
     
     UPSTAGE();
